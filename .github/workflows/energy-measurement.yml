@@ -1,0 +1,222 @@
+name: Energy Measurement
+run-name: Energy measurement (${{ inputs.campaign }})
+
+# Dedicated workflow that invokes the locally validated run_pipeline.sh on a
+# self-hosted runner. It does not replace or modify the original CI workflows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "validation = run 0 only (smoke test) | full = warm-up + runs 1..10 + median"
+        type: choice
+        required: true
+        default: validation
+        options:
+          - validation
+          - full
+
+jobs:
+  measure:
+    runs-on: [self-hosted, linux]
+    env:
+      # The Actions `env` context does not expose the runner process HOME.
+      HOME_DIR: /home/maycon
+    timeout-minutes: 1200
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Make RAPL counters readable
+        run: sudo /usr/local/bin/rapl-set-readable
+
+      - name: Check RAPL availability
+        run: |
+          if [ ! -d /sys/class/powercap/intel-rapl ]; then
+            echo "RAPL not available on this runner"
+            exit 1
+          fi
+          echo "Available RAPL domains:"
+          ls /sys/class/powercap/intel-rapl/
+
+      - name: Check Docker image
+        run: |
+          if ! docker image inspect ncnn-measurement-20240820 &>/dev/null; then
+            echo "Image 'ncnn-measurement-20240820' not found on the runner."
+            echo "Build it manually before dispatching this workflow, from a clone of this branch:"
+            echo "  docker build -t ncnn-measurement-20240820 -f energy-measurement/Dockerfile ."
+            exit 1
+          fi
+          echo "Docker image found."
+          docker image inspect ncnn-measurement-20240820 --format '{{.Created}}'
+
+      - name: Validation run (run 0)
+        if: ${{ inputs.campaign == 'validation' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/ncnn/release-20240820/runs"
+          bash "$HOME/experimentos/medicao/repositorios/ncnn/release-20240820/run_pipeline.sh" 0
+          # Run 0 is a smoke test; keep it out of the median aggregation glob.
+          mkdir -p "$RESULTS_DIR/validation"
+          if [ -f "$RESULTS_DIR/run_00.csv" ]; then
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/validation/run_00.csv"
+            echo "run_00.csv moved to runs/validation/ (excluded from results)"
+          fi
+          for side in "$RESULTS_DIR"/swap_run_00_*.txt "$RESULTS_DIR"/temp_run_00_*.txt; do
+            if [ -f "$side" ]; then
+              mv -f "$side" "$RESULTS_DIR/validation/"
+            fi
+          done
+          awk -F, '
+            NR==1 { next }
+            ($2 ~ /^build_/ || $2 ~ /^test_/) && $7+0 > 0 {
+              r = ($8 + $9) / $7
+              if (r < 0.5)
+                printf "::warning::[run 0] step %s: (user+sys)/wall = %.4f < 0.5 (user=%ss sys=%ss wall=%ss) - user/sys capture may have regressed to the host\n", $2, r, $8, $9, $7
+            }
+          ' "$RESULTS_DIR/validation/run_00.csv"
+
+      - name: Run 10 measurement runs
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/ncnn/release-20240820/runs"
+          PIPELINE="$HOME/experimentos/medicao/repositorios/ncnn/release-20240820/run_pipeline.sh"
+          # Ensure no validation run_00.csv pollutes the median.
+          rm -f "$RESULTS_DIR/run_00.csv"
+
+          # A run CSV is valid when the aggregate stages are present and the critical energy/wall columns are non-empty and positive; user/sys columns are diagnostic and not validated.
+          validate_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # Non-blocking sanity check: (user+sys)/wall below 0.5 in CPU-bound stages indicates user/sys captured the host docker client instead of the container processes; energy and wall do not depend on these columns.
+          warn_user_sys() {
+            local csv="$1" origin="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origin="$origin" '
+              NR==1 { next }
+              ($2 ~ /^build_/ || $2 ~ /^test_/) && $7+0 > 0 {
+                r = ($8 + $9) / $7
+                if (r < 0.5)
+                  printf "::warning::[%s] step %s: (user+sys)/wall = %.4f < 0.5 (user=%ss sys=%ss wall=%ss) - user/sys capture may have regressed to the host\n", origin, $2, r, $8, $9, $7
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # Discarded warm-up convention: 11 runs, median over the 10 valid ones.
+          PENDING=0
+          for i in $(seq 1 10); do
+            validate_csv "$RESULTS_DIR/run_$(printf '%02d' "$i").csv" || PENDING=$((PENDING+1))
+          done
+          if [ "$PENDING" -gt 0 ]; then
+            echo "::group::Warm-up (discarded from analysis)"
+            echo "$PENDING pending run(s) - executing warm-up before official runs"
+            mkdir -p "$RESULTS_DIR/warmup"
+            bash "$PIPELINE" 0
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
+            for side in "$RESULTS_DIR"/swap_run_00_*.txt "$RESULTS_DIR"/temp_run_00_*.txt; do
+              if [ -f "$side" ]; then
+                base=$(basename "$side")
+                mv -f "$side" "$RESULTS_DIR/warmup/${base/_run_00_/_run_warmup_}"
+              fi
+            done
+            warn_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            {
+              echo "## Warm-up executed and DISCARDED (not in the median)"
+              echo "- $PENDING pending run(s) this session; CSV at \`runs/warmup/run_warmup.csv\` (overwritten each session)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            echo "Post-warm-up rest (120s)..."
+            sleep 120
+          else
+            echo "Campaign already complete (10 valid runs) - warm-up not needed"
+            echo "## Warm-up skipped - campaign already complete" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "## Execution (full mode) - skip-if-exists" >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            CSV="$RESULTS_DIR/run_${NN}.csv"
+            echo "::group::Run $i of 10"
+            if validate_csv "$CSV"; then
+              echo "Run $NN already exists and is valid - skipping"
+              echo "- Run $NN: already valid - **skipped**" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              continue
+            fi
+            if [ -f "$CSV" ]; then
+              echo "Run $NN incomplete/invalid - re-executing (overwrite)"
+              echo "- Run $NN: invalid/incomplete CSV - **re-executed**" >> "$GITHUB_STEP_SUMMARY"
+              rm -f "$CSV"
+            else
+              echo "Run $NN missing - executing"
+              echo "- Run $NN: missing - **executed**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            bash "$PIPELINE" "$i"
+            warn_user_sys "$CSV" "run $NN"
+            echo "::endgroup::"
+            if [ "$i" -lt 10 ]; then
+              echo "Rest between runs (120s)..."
+              sleep 120
+            fi
+          done
+
+          # Final sweep also covers pre-existing runs skipped above.
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            warn_user_sys "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+          done
+
+      - name: Aggregate medians
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/ncnn/release-20240820/runs"
+          SUMMARY="$HOME/experimentos/medicao/resultados/ncnn/release-20240820/summary.csv"
+          python3 "$HOME/experimentos/medicao/scripts/aggregate.py" "$RESULTS_DIR" "$SUMMARY"
+          {
+            echo ""
+            echo "## Medians (10 runs) - ncnn 20240820"
+            echo '```'
+            cat "$SUMMARY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Docker --privileged writes files as root in the workspace; fix ownership through a disposable container.
+      - name: Fix workspace permissions
+        if: always()
+        run: |
+          docker run --rm --privileged \
+            -v "${{ github.workspace }}":/w \
+            alpine chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-ncnn-20240820-${{ github.run_number }}
+          # Internal notes are runner-local documents and stay out of the artifact.
+          path: |
+            ${{ env.HOME_DIR }}/experimentos/medicao/resultados/ncnn/release-20240820/
+            !${{ env.HOME_DIR }}/experimentos/medicao/resultados/ncnn/release-20240820/NOTA_FIDELIDADE*.md
+          retention-days: 90
+
